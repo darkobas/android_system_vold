@@ -97,6 +97,12 @@ static char *saved_mount_point;
 static int  master_key_saved = 0;
 static struct crypt_persist_data *persist_data = NULL;
 
+#ifdef MINIVOLD
+inline int release_wake_lock(const char* id) { return 0; };
+inline int acquire_wake_lock(int lock, const char* id) { return 0; };
+#endif
+
+#ifndef MINIVOLD // no HALs in recovery...
 static int keymaster_init(keymaster_device_t **keymaster_dev)
 {
     int rc;
@@ -121,10 +127,14 @@ out:
     *keymaster_dev = NULL;
     return rc;
 }
+#endif
 
 /* Should we use keymaster? */
 static int keymaster_check_compatibility()
 {
+#ifdef MINIVOLD
+    return -1;
+#else
     keymaster_device_t *keymaster_dev = 0;
     int rc = 0;
 
@@ -150,11 +160,15 @@ static int keymaster_check_compatibility()
 out:
     keymaster_close(keymaster_dev);
     return rc;
+#endif
 }
 
 /* Create a new keymaster key and store it in this footer */
 static int keymaster_create_key(struct crypt_mnt_ftr *ftr)
 {
+#ifdef MINIVOLD // no HALs in recovery...
+    return -1;
+#else
     uint8_t* key = 0;
     keymaster_device_t *keymaster_dev = 0;
 
@@ -191,6 +205,7 @@ out:
     keymaster_close(keymaster_dev);
     free(key);
     return rc;
+#endif
 }
 
 /* This signs the given object using the keymaster key. */
@@ -200,6 +215,9 @@ static int keymaster_sign_object(struct crypt_mnt_ftr *ftr,
                                  unsigned char **signature,
                                  size_t *signature_size)
 {
+#ifdef MINIVOLD // no HALs in recovery...
+    return -1;
+#else
     int rc = 0;
     keymaster_device_t *keymaster_dev = 0;
     if (keymaster_init(&keymaster_dev)) {
@@ -277,6 +295,7 @@ static int keymaster_sign_object(struct crypt_mnt_ftr *ftr,
 
     keymaster_close(keymaster_dev);
     return rc;
+#endif
 }
 
 /* Store password when userdata is successfully decrypted and mounted.
@@ -573,6 +592,7 @@ static void upgrade_crypt_ftr(int fd, struct crypt_mnt_ftr *crypt_ftr, off64_t o
         /* Need to initialize the persistent data area */
         if (lseek64(fd, pdata_offset, SEEK_SET) == -1) {
             SLOGE("Cannot seek to persisent data offset\n");
+            free(pdata);
             return;
         }
         /* Write all zeros to the first copy, making it invalid */
@@ -587,6 +607,7 @@ static void upgrade_crypt_ftr(int fd, struct crypt_mnt_ftr *crypt_ftr, off64_t o
         crypt_ftr->persist_data_offset[0] = pdata_offset;
         crypt_ftr->persist_data_offset[1] = pdata_offset + CRYPT_PERSIST_DATA_SIZE;
         crypt_ftr->minor_version = 1;
+        free(pdata);
     }
 
     if ((crypt_ftr->major_version == 1) && (crypt_ftr->minor_version == 1)) {
@@ -874,13 +895,13 @@ static int save_persistent_data(void)
     }
 
     /* Write the new copy first, if successful, then erase the old copy */
-    if (lseek(fd, write_offset, SEEK_SET) < 0) {
+    if (lseek64(fd, write_offset, SEEK_SET) < 0) {
         SLOGE("Cannot seek to write persistent data");
         goto err2;
     }
     if (unix_write(fd, persist_data, crypt_ftr.persist_data_size) ==
         (int) crypt_ftr.persist_data_size) {
-        if (lseek(fd, erase_offset, SEEK_SET) < 0) {
+        if (lseek64(fd, erase_offset, SEEK_SET) < 0) {
             SLOGE("Cannot seek to erase previous persistent data");
             goto err2;
         }
@@ -997,20 +1018,29 @@ static int load_crypto_mapping_table(struct crypt_mnt_ftr *crypt_ftr, unsigned c
   tgt->sector_start = 0;
   tgt->length = crypt_ftr->fs_size;
 #ifdef CONFIG_HW_DISK_ENCRYPTION
-  if (!strcmp((char *)crypt_ftr->crypto_type_name, "aes-xts")) {
-    strlcpy(tgt->target_type, "req-crypt", DM_MAX_TYPE_NAME);
-  }
-  else {
+  if(is_hw_disk_encryption((char*)crypt_ftr->crypto_type_name))
+    strlcpy(tgt->target_type, "req-crypt",DM_MAX_TYPE_NAME);
+  else
     strlcpy(tgt->target_type, "crypt", DM_MAX_TYPE_NAME);
-  }
 #else
-  strlcpy(tgt->target_type, "crypt", DM_MAX_TYPE_NAME);
+  strcpy(tgt->target_type, "crypt");
 #endif
 
   crypt_params = buffer + sizeof(struct dm_ioctl) + sizeof(struct dm_target_spec);
+#ifdef CONFIG_HW_DISK_ENCRYPTION
+  if (is_ice_enabled())
+    convert_key_to_hex_ascii(master_key, sizeof(int), master_key_ascii);
+  else
+    convert_key_to_hex_ascii(master_key, crypt_ftr->keysize, master_key_ascii);
+#else
   convert_key_to_hex_ascii(master_key, crypt_ftr->keysize, master_key_ascii);
-  sprintf(crypt_params, "%s %s 0 %s 0 %s", crypt_ftr->crypto_type_name,
+#endif
+  sprintf(crypt_params, "%s %s 0 %s 0 %s 0", crypt_ftr->crypto_type_name,
           master_key_ascii, real_blk_name, extra_params);
+
+  SLOGI("%s: target_type = %s\n", __func__, tgt->target_type);
+  SLOGI("%s: real_blk_name = %s, extra_params = %s\n", __func__, real_blk_name, extra_params);
+
   crypt_params += strlen(crypt_params) + 1;
   crypt_params = (char *) (((unsigned long)crypt_params + 7) & ~8); /* Align to an 8 byte boundary */
   tgt->next = crypt_params - buffer;
@@ -1052,7 +1082,7 @@ static int get_dm_crypt_version(int fd, const char *name,  int *version)
     v = (struct dm_target_versions *) &buffer[sizeof(struct dm_ioctl)];
     while (v->next) {
 #ifdef CONFIG_HW_DISK_ENCRYPTION
-        if (! strcmp(v->name, "crypt") || ! strcmp(v->name, "req-crypt")) {
+        if(!strcmp(v->name, "crypt") || !strcmp(v->name, "req-crypt")) {
 #else
         if (! strcmp(v->name, "crypt")) {
 #endif
@@ -1083,6 +1113,10 @@ static int create_crypto_blk_dev(struct crypt_mnt_ftr *crypt_ftr, unsigned char 
   int version[3];
   char *extra_params;
   int load_count;
+#ifdef CONFIG_HW_DISK_ENCRYPTION
+  char encrypted_state[PROPERTY_VALUE_MAX] = {0};
+  char progress[PROPERTY_VALUE_MAX] = {0};
+#endif
 
   if ((fd = open("/dev/device-mapper", O_RDWR)) < 0 ) {
     SLOGE("Cannot open device-mapper\n");
@@ -1106,6 +1140,19 @@ static int create_crypto_blk_dev(struct crypt_mnt_ftr *crypt_ftr, unsigned char 
   minor = (io->dev & 0xff) | ((io->dev >> 12) & 0xfff00);
   snprintf(crypto_blk_name, MAXPATHLEN, "/dev/block/dm-%u", minor);
 
+#ifdef CONFIG_HW_DISK_ENCRYPTION
+  /* Set fde_enabled if either FDE completed or in-progress */
+  property_get("ro.crypto.state", encrypted_state, ""); /* FDE completed */
+  property_get("vold.encrypt_progress", progress, ""); /* FDE in progress */
+  if (!strcmp(encrypted_state, "encrypted") || strcmp(progress, "")) {
+      if (is_ice_enabled())
+          extra_params = "fde_enabled ice";
+      else
+      extra_params = "fde_enabled";
+  }
+  else
+      extra_params = "fde_disabled";
+#else
   extra_params = "";
   if (! get_dm_crypt_version(fd, name, version)) {
       /* Support for allow_discards was added in version 1.11.0 */
@@ -1115,6 +1162,7 @@ static int create_crypto_blk_dev(struct crypt_mnt_ftr *crypt_ftr, unsigned char 
           SLOGI("Enabling support for allow_discards in dmcrypt.\n");
       }
   }
+#endif
 
   load_count = load_crypto_mapping_table(crypt_ftr, master_key, real_blk_name, name,
                                          fd, extra_params);
@@ -1769,13 +1817,44 @@ static int test_mount_encrypted_fs(struct crypt_mnt_ftr* crypt_ftr,
   fs_mgr_get_crypt_info(fstab, 0, real_blkdev, sizeof(real_blkdev));
 
 #ifdef CONFIG_HW_DISK_ENCRYPTION
-  if (!strcmp((char *)crypt_ftr->crypto_type_name, "aes-xts")) {
-    if(!set_hw_device_encryption_key(passwd, (char*) crypt_ftr->crypto_type_name)) {
-      SLOGE("Hardware encryption key does not match");
+  int key_index = 0;
+  if(is_hw_disk_encryption((char*)crypt_ftr->crypto_type_name)) {
+    key_index = set_hw_device_encryption_key(passwd, (char*) crypt_ftr->crypto_type_name);
+    if (key_index < 0) {
+      rc = -1;
+    }
+    else {
+      if (is_ice_enabled()) {
+#if 0
+        if (create_crypto_blk_dev(crypt_ftr, &key_index,
+                            real_blkdev, crypto_blkdev, label)) {
+          SLOGE("Error creating decrypted block device\n");
+          rc = -1;
+          goto errout;
+        }
+#endif
+      } else {
+        if (create_crypto_blk_dev(crypt_ftr, decrypted_master_key,
+                            real_blkdev, crypto_blkdev, label)) {
+          SLOGE("Error creating decrypted block device\n");
+          rc = -1;
+          goto errout;
+        }
+      }
+    }
+  } else {
+    /* in case HW FDE is delivered through OTA  and device is already encrypted
+     * using SW FDE, we should let user continue using SW FDE until userdata is
+     * wiped.
+     */
+    if (create_crypto_blk_dev(crypt_ftr, decrypted_master_key,
+                            real_blkdev, crypto_blkdev, label)) {
+      SLOGE("Error creating decrypted block device\n");
+      rc = -1;
+      goto errout;
     }
   }
-#endif
-
+#else
   // Create crypto block device - all (non fatal) code paths
   // need it
   if (create_crypto_blk_dev(crypt_ftr, decrypted_master_key,
@@ -1784,6 +1863,7 @@ static int test_mount_encrypted_fs(struct crypt_mnt_ftr* crypt_ftr,
      rc = -1;
      goto errout;
   }
+#endif
 
   /* Work out if the problem is the password or the data */
   unsigned char scrypted_intermediate_key[sizeof(crypt_ftr->
@@ -2230,6 +2310,11 @@ static int cryptfs_enable_wipe(char *crypto_blkdev, off64_t size, int type)
 #define BLOCKS_AT_A_TIME 1024
 #endif
 
+/* Number of blocks to write before an explicit flush
+   to reduce disk buffer usage during inplace encryption
+ */
+#define BLOCKS_BEFORE_FLUSH 128
+
 struct encryptGroupsData
 {
     int realfd;
@@ -2321,6 +2406,8 @@ static void log_progress(struct encryptGroupsData const* data, bool completed)
 
 static int flush_outstanding_data(struct encryptGroupsData* data)
 {
+    static int64_t blocks_bufferred = 0;
+
     if (data->count == 0) {
         return 0;
     }
@@ -2343,6 +2430,12 @@ static int flush_outstanding_data(struct encryptGroupsData* data)
         return -1;
     } else {
       log_progress(data, false);
+    }
+
+    blocks_bufferred += data->count;
+    if (blocks_bufferred >= BLOCKS_BEFORE_FLUSH) {
+        fdatasync(data->cryptofd);
+        blocks_bufferred = 0;
     }
 
     data->count = 0;
@@ -2464,11 +2557,19 @@ static int cryptfs_enable_inplace_ext4(char *crypto_blkdev,
         goto errout;
     }
 
-    if ( (data.cryptofd = open(crypto_blkdev, O_WRONLY)) < 0) {
-        SLOGE("Error opening crypto_blkdev %s for ext4 inplace encrypt. err=%d(%s)\n",
-              crypto_blkdev, errno, strerror(errno));
-        rc = ENABLE_INPLACE_ERR_DEV;
-        goto errout;
+    // Wait until the block device appears.  Re-use the mount retry values since it is reasonable.
+    int retries = RETRY_MOUNT_ATTEMPTS;
+    while ((data.cryptofd = open(crypto_blkdev, O_WRONLY)) < 0) {
+        if (--retries) {
+            SLOGE("Error opening crypto_blkdev %s for ext4 inplace encrypt. err=%d(%s), retrying\n",
+                  crypto_blkdev, errno, strerror(errno));
+            sleep(RETRY_MOUNT_DELAY_SECONDS);
+        } else {
+            SLOGE("Error opening crypto_blkdev %s for ext4 inplace encrypt. err=%d(%s)\n",
+                  crypto_blkdev, errno, strerror(errno));
+            rc = ENABLE_INPLACE_ERR_DEV;
+            goto errout;
+        }
     }
 
     if (setjmp(setjmp_env)) {
@@ -2936,6 +3037,9 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, char *passwd,
     int num_vols;
     struct volume_info *vol_list = 0;
     off64_t previously_encrypted_upto = 0;
+#ifdef CONFIG_HW_DISK_ENCRYPTION
+    int key_index = 0;
+#endif
 
     if (!strcmp(howarg, "wipe")) {
       how = CRYPTO_ENABLE_WIPE;
@@ -3063,6 +3167,62 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, char *passwd,
         }
     }
 
+    /* Start the actual work of making an encrypted filesystem */
+    /* Initialize a crypt_mnt_ftr for the partition */
+    if (previously_encrypted_upto == 0) {
+        if (cryptfs_init_crypt_mnt_ftr(&crypt_ftr)) {
+            goto error_shutting_down;
+        }
+
+        if (!strcmp(key_loc, KEY_IN_FOOTER)) {
+            crypt_ftr.fs_size = nr_sec
+              - (CRYPT_FOOTER_OFFSET / CRYPT_SECTOR_SIZE);
+        } else {
+            crypt_ftr.fs_size = nr_sec;
+        }
+        /* At this point, we are in an inconsistent state. Until we successfully
+           complete encryption, a reboot will leave us broken. So mark the
+           encryption failed in case that happens.
+           On successfully completing encryption, remove this flag */
+        crypt_ftr.flags |= CRYPT_INCONSISTENT_STATE;
+        crypt_ftr.crypt_type = crypt_type;
+#ifndef CONFIG_HW_DISK_ENCRYPTION
+        strlcpy((char *)crypt_ftr.crypto_type_name, "aes-cbc-essiv:sha256", MAX_CRYPTO_TYPE_NAME_LEN);
+#else
+        strlcpy((char *)crypt_ftr.crypto_type_name, "aes-xts", MAX_CRYPTO_TYPE_NAME_LEN);
+        wipe_hw_device_encryption_key((char*)crypt_ftr.crypto_type_name);
+        key_index = set_hw_device_encryption_key(passwd, (char*)crypt_ftr.crypto_type_name);
+        if (key_index < 0)
+          goto error_shutting_down;
+#endif
+
+        /* Make an encrypted master key */
+        if (create_encrypted_random_key(passwd, crypt_ftr.master_key, crypt_ftr.salt, &crypt_ftr)) {
+            SLOGE("Cannot create encrypted master key\n");
+            goto error_shutting_down;
+        }
+
+        /* Write the key to the end of the partition */
+        if (put_crypt_ftr_and_key(&crypt_ftr)) {
+            SLOGE("Error writing the key to the end of the partition\n");
+            goto error_shutting_down;
+        }
+
+        /* If any persistent data has been remembered, save it.
+         * If none, create a valid empty table and save that.
+         */
+        if (!persist_data) {
+           pdata = malloc(CRYPT_PERSIST_DATA_SIZE);
+           if (pdata) {
+               init_empty_persist_data(pdata, CRYPT_PERSIST_DATA_SIZE);
+               persist_data = pdata;
+           }
+        }
+        if (persist_data) {
+            save_persistent_data();
+        }
+    }
+
     /* Do extra work for a better UX when doing the long inplace encryption */
     if (how == CRYPTO_ENABLE_INPLACE) {
         /* Now that /data is unmounted, we need to mount a tmpfs
@@ -3087,70 +3247,7 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, char *passwd,
          * restart the graphics services.
          */
         sleep(2);
-    }
 
-    /* Start the actual work of making an encrypted filesystem */
-    /* Initialize a crypt_mnt_ftr for the partition */
-    if (previously_encrypted_upto == 0) {
-        if (cryptfs_init_crypt_mnt_ftr(&crypt_ftr)) {
-            goto error_shutting_down;
-        }
-
-        if (!strcmp(key_loc, KEY_IN_FOOTER)) {
-            crypt_ftr.fs_size = nr_sec
-              - (CRYPT_FOOTER_OFFSET / CRYPT_SECTOR_SIZE);
-        } else {
-            crypt_ftr.fs_size = nr_sec;
-        }
-        /* At this point, we are in an inconsistent state. Until we successfully
-           complete encryption, a reboot will leave us broken. So mark the
-           encryption failed in case that happens.
-           On successfully completing encryption, remove this flag */
-        crypt_ftr.flags |= CRYPT_INCONSISTENT_STATE;
-        crypt_ftr.crypt_type = crypt_type;
-#ifndef CONFIG_HW_DISK_ENCRYPTION
-        strlcpy((char *)crypt_ftr.crypto_type_name, "aes-cbc-essiv:sha256", MAX_CRYPTO_TYPE_NAME_LEN);
-#else
-        strlcpy((char *)crypt_ftr.crypto_type_name, "aes-xts", MAX_CRYPTO_TYPE_NAME_LEN);
-
-        rc = clear_hw_device_encryption_key();
-        if (!rc) {
-          SLOGE("Error clearing device encryption hardware key. rc = %d", rc);
-        }
-
-        rc = set_hw_device_encryption_key(passwd,
-                                          (char*) crypt_ftr.crypto_type_name);
-        if (!rc) {
-          SLOGE("Error initializing device encryption hardware key. rc = %d", rc);
-          goto error_shutting_down;
-        }
-#endif
-
-        /* Make an encrypted master key */
-        if (create_encrypted_random_key(passwd, crypt_ftr.master_key, crypt_ftr.salt, &crypt_ftr)) {
-            SLOGE("Cannot create encrypted master key\n");
-            goto error_shutting_down;
-        }
-
-        /* Write the key to the end of the partition */
-        put_crypt_ftr_and_key(&crypt_ftr);
-
-        /* If any persistent data has been remembered, save it.
-         * If none, create a valid empty table and save that.
-         */
-        if (!persist_data) {
-           pdata = malloc(CRYPT_PERSIST_DATA_SIZE);
-           if (pdata) {
-               init_empty_persist_data(pdata, CRYPT_PERSIST_DATA_SIZE);
-               persist_data = pdata;
-           }
-        }
-        if (persist_data) {
-            save_persistent_data();
-        }
-    }
-
-    if (how == CRYPTO_ENABLE_INPLACE) {
         /* startup service classes main and late_start */
         property_set("vold.decrypt", "trigger_restart_min_framework");
         SLOGD("Just triggered restart_min_framework\n");
@@ -3163,8 +3260,20 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, char *passwd,
     }
 
     decrypt_master_key(passwd, decrypted_master_key, &crypt_ftr, 0, 0);
+#ifdef CONFIG_HW_DISK_ENCRYPTION
+    if (is_hw_disk_encryption((char*)crypt_ftr.crypto_type_name) && is_ice_enabled()) {
+#if 0
+      create_crypto_blk_dev(&crypt_ftr, &key_index, real_blkdev, crypto_blkdev,
+                          "userdata");
+#endif
+     } else
+      create_crypto_blk_dev(&crypt_ftr, decrypted_master_key, real_blkdev, crypto_blkdev,
+                          "userdata");
+
+#else
     create_crypto_blk_dev(&crypt_ftr, decrypted_master_key, real_blkdev, crypto_blkdev,
                           "userdata");
+#endif
 
     /* If we are continuing, check checksums match */
     rc = 0;
@@ -3212,6 +3321,8 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, char *passwd,
             crypt_ftr.flags |= CRYPT_ENCRYPTION_IN_PROGRESS;
         }
 
+        if (how == CRYPTO_ENABLE_INPLACE)
+            crypt_ftr.flags |= CRYPT_FDE_COMPLETED;
         put_crypt_ftr_and_key(&crypt_ftr);
 
         if (how == CRYPTO_ENABLE_WIPE
@@ -3291,6 +3402,250 @@ error_shutting_down:
     return -1;
 }
 
+/**
+ *  Map /data to dm-req-crypt upon PFE Activation.
+ *
+ *  The UI framework needs to be shut-down and restart.
+ *
+ * based on cryptfs_enable() + cryptfs_restart()
+ */
+int cryptfs_pfe_activate(void)
+{
+    char crypto_blkdev[MAXPATHLEN];
+    char real_blkdev[MAXPATHLEN];
+    unsigned long nr_sec;
+    unsigned char decrypted_master_key[KEY_LEN_BYTES] = {0}; /* N.A */
+    int rc = -1;
+    int fd = -1; /* real_blkdev file descriptor */
+    struct crypt_mnt_ftr crypt_ftr = {0};
+    char encrypted_state[PROPERTY_VALUE_MAX] = {0};
+    char pfe_state[PROPERTY_VALUE_MAX] = {0};
+    char lockid[32] = { 0};
+    char key_loc[PROPERTY_VALUE_MAX] = {0};
+    int retry = 5; /* mount retry, /data might be hold by services going down */
+
+    SLOGI("Start PFE mapping upon activation..");
+
+    property_get("vold.pfe", pfe_state, "");
+    if (!strcmp(pfe_state, "activated") ) {
+        SLOGI("PFE already activated!");
+        return 0;
+    }
+
+    /* If FDE actiavted, no mapping required, just set a flag in the footer */
+    property_get("ro.crypto.state", encrypted_state, "");
+    if (strcmp(encrypted_state, "encrypted") == 0) {
+        SLOGI("FDE activated , no need to map crypto-device");
+
+        /* get the footer */
+        if (get_crypt_ftr_and_key(&crypt_ftr)) {
+            SLOGE("Error getting crypt footer");
+            return -1;
+        }
+
+        /* Set PFE flag */
+        crypt_ftr.flags |= CRYPT_PFE_ACTIVATED;
+
+        /* save the flag in the footer */
+        if (put_crypt_ftr_and_key(&crypt_ftr)) {
+            SLOGE("Error saving crypt footer");
+            return -1;
+        }
+
+        property_set("vold.pfe", "activated");
+        SLOGI("%s: PFE-Enable (after FDE) completed OK", __func__);
+
+        return 0;
+    }
+
+    property_set("vold.pfe", ""); /* reset prop */
+
+    fs_mgr_get_crypt_info(fstab, key_loc, 0, sizeof(key_loc));
+
+    fs_mgr_get_crypt_info(fstab, 0, real_blkdev, sizeof(real_blkdev));
+
+    /* Get the size of the real block device */
+    fd = open(real_blkdev, O_RDONLY);
+    if ( (nr_sec = get_blkdev_size(fd)) == 0) {
+        SLOGE("Cannot get size of block device %s", real_blkdev);
+        goto get_size_error;
+    }
+    close(fd);
+
+    /* Get a wakelock as this may take a while, and we don't want the
+     * device to sleep on us.  We'll grab a partial wakelock, and if the UI
+     * wants to keep the screen on, it can grab a full wakelock.
+     */
+    snprintf(lockid, sizeof(lockid), "enablecrypto%d", (int) getpid());
+    acquire_wake_lock(PARTIAL_WAKE_LOCK, lockid);
+
+    /* Allow caller to get response */
+    sleep(1);
+
+    /* The init files are setup to stop the class main and late start when
+     * vold sets trigger_shutdown_framework.
+     */
+    property_set("vold.decrypt", "trigger_shutdown_framework");
+    SLOGI("Just asked init to shut down class main");
+
+    if (vold_unmountAllAsecs()) {
+        /* Just report the error.  If any are left mounted,
+         * umounting /data below will fail and handle the error.
+         */
+        SLOGE("Error unmounting internal asecs");
+    }
+
+    /* Now unmount the /data partition. */
+    if (wait_and_unmount(DATA_MNT_POINT, false)) {
+        SLOGE("%s: Unmount /data failed", __func__);
+        goto unmount_error;
+    }
+
+    /* Start the actual work of making an encrypted filesystem */
+    /* Initialize a crypt_mnt_ftr for the partition */
+    cryptfs_init_crypt_mnt_ftr(&crypt_ftr);
+
+    if (!strcmp(key_loc, KEY_IN_FOOTER)) {
+        SLOGI("Use fs_size from footer");
+        crypt_ftr.fs_size = nr_sec - (CRYPT_FOOTER_OFFSET / 512);
+    } else {
+        SLOGI("Use fs_size from get-blk-size");
+        crypt_ftr.fs_size = nr_sec;
+    }
+
+    strlcpy((char *)crypt_ftr.crypto_type_name, "aes-xts", MAX_CRYPTO_TYPE_NAME_LEN);
+
+    rc = create_crypto_blk_dev(&crypt_ftr, decrypted_master_key,
+                               real_blkdev, crypto_blkdev, "userdata");
+    if (rc) {
+        SLOGE("%s: Create crypto block-device failed !", __func__);
+        goto mapping_err;
+    }
+
+    sleep(1); // Sleep before mount
+
+    /* If that succeeded, then mount the decrypted filesystem */
+    while (retry) {
+        rc = fs_mgr_do_mount(fstab, DATA_MNT_POINT, crypto_blkdev, 0);
+        if (rc) {
+            SLOGE("%s: Mount /data to crypto device FAILED !", __func__);
+            if (retry == 0) {
+                goto mapping_err;
+            }
+        } else {
+            SLOGI("%s: Mount /data to crypto device OK !", __func__);
+            break;
+        }
+        retry--;
+        sleep(3); // Sleep few seconds before retry
+    }
+
+    property_set("vold.decrypt", "trigger_load_persist_props");
+    /* Create necessary paths on /data */
+    if (prep_data_fs()) {
+        SLOGE("%s: prep_data_fs() FAILED !", __func__);
+        goto mapping_err;
+    }
+
+    /* startup service classes main and late_start */
+    property_set("vold.decrypt", "trigger_restart_framework");
+    SLOGI("Just triggered restart_framework");
+
+    /* Give it a few moments to get started */
+    sleep(1);
+
+    release_wake_lock(lockid);
+
+    crypt_ftr.flags |= CRYPT_PFE_ACTIVATED;
+
+    /* Write the footer with flag activated */
+    put_crypt_ftr_and_key(&crypt_ftr);
+
+    property_set("vold.pfe", "activated");
+
+    SLOGI("%s: PFE-Enable (no FDE) completed OK", __func__);
+    return 0;
+
+error_shutting_down:
+mapping_err:
+    delete_crypto_blk_dev("userdata");
+error_unencrypted:
+random_key_error:
+unmount_error:
+    release_wake_lock(lockid);
+get_size_error:
+    property_set("vold.pfe", "failed");
+    SLOGI("%s: PFE Enable Failed", __func__);
+
+    return -1;
+}
+
+/* Clear PFE activated flag. */
+int cryptfs_pfe_deactivate(void)
+{
+    struct crypt_mnt_ftr crypt_ftr;
+
+    SLOGI("Start cryptfs_pfe_deactivate");
+
+    /* get the footer */
+    if (get_crypt_ftr_and_key(&crypt_ftr)) {
+        SLOGE("Error getting crypt footer");
+        return -1;
+    }
+
+    /* clear the flag */
+    crypt_ftr.flags &= ~CRYPT_PFE_ACTIVATED;
+
+    /* save the footer */
+    if (put_crypt_ftr_and_key(&crypt_ftr)) {
+        SLOGE("Error saving crypt footer");
+        return -1;
+    }
+
+    property_set("vold.pfe", "deactivated");
+
+    return 0;
+}
+
+/*
+ *  Mount /data to dm-req-crypt on BOOT (if activated), same as after FDE.
+ *
+ *  Note: After FDE is encrypted, the following commands are called on boot:
+ *  1. cryptocomplete   -> cryptfs_crypto_complete()
+ *  2. checkpw          -> cryptfs_check_passwd()
+ *  3. restart          -> cryptfs_restart()
+ *
+ * see test_mount_encrypted_fs()
+ */
+int cryptfs_pfe_boot(void)
+{
+    struct crypt_mnt_ftr crypt_ftr = {0};
+
+    SLOGI("Check if PFE is activated on Boot");
+
+    if (get_crypt_ftr_and_key(&crypt_ftr)) {
+        SLOGE("Error getting crypt footer and key");
+        goto exit_err;
+    }
+
+    if (!(crypt_ftr.flags & CRYPT_PFE_ACTIVATED) ) {
+        SLOGE("PFE not activated");
+        goto exit_err;
+    }
+
+    if (crypt_ftr.flags & CRYPT_FDE_COMPLETED) {
+        SLOGI("FDE Completed , let FDE do the crypto mount");
+        goto exit_err;
+    }
+
+    /* Mount /data , same as on activate command */
+    return cryptfs_pfe_activate();
+
+exit_err:
+    property_set("vold.pfe", "deactivated");  /* Default */
+    return -1;
+}
+
 int cryptfs_enable(char *howarg, int type, char *passwd, int allow_reboot)
 {
     char* adjusted_passwd = adjust_passwd(passwd);
@@ -3339,15 +3694,21 @@ int cryptfs_changepw(int crypt_type, const char *newpw)
         newpw = adjusted_passwd;
     }
 
-    encrypt_master_key(crypt_type == CRYPT_TYPE_DEFAULT ? DEFAULT_PASSWORD
-                                                        : newpw,
+    if (encrypt_master_key(crypt_type == CRYPT_TYPE_DEFAULT ? DEFAULT_PASSWORD
+                                                            : newpw,
                        crypt_ftr.salt,
                        saved_master_key,
                        crypt_ftr.master_key,
-                       &crypt_ftr);
+                       &crypt_ftr)) {
+        SLOGE("Error encrypting master key");
+        return -1;
+    }
 
     /* save the key */
-    put_crypt_ftr_and_key(&crypt_ftr);
+    if (put_crypt_ftr_and_key(&crypt_ftr)) {
+        SLOGE("Failed to save key");
+        return -1;
+    }
 
     free(adjusted_passwd);
 
