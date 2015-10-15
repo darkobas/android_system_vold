@@ -176,12 +176,15 @@ struct crypt_persist_data {
 #define DATA_MNT_POINT "/data"
 
 /* Return values for cryptfs_crypto_complete */
-#define CRYPTO_COMPLETE_NOT_ENCRYPTED  1
-#define CRYPTO_COMPLETE_ENCRYPTED      0
-#define CRYPTO_COMPLETE_BAD_METADATA  -1
-#define CRYPTO_COMPLETE_PARTIAL       -2
-#define CRYPTO_COMPLETE_INCONSISTENT  -3
-#define CRYPTO_COMPLETE_CORRUPT       -4
+#define CRYPTO_COMPLETE_ENCRYPTED_MDTP_ACTIVATED   2
+#define CRYPTO_COMPLETE_NOT_ENCRYPTED              1
+#define CRYPTO_COMPLETE_ENCRYPTED                  0
+#define CRYPTO_COMPLETE_BAD_METADATA              -1
+#define CRYPTO_COMPLETE_PARTIAL                   -2
+#define CRYPTO_COMPLETE_INCONSISTENT              -3
+#define CRYPTO_COMPLETE_CORRUPT                   -4
+#define CRYPTO_COMPLETE_ERROR_MDTP_ACTIVATED      -5
+
 
 /* Return values for cryptfs_enable_inplace*() */
 #define ENABLE_INPLACE_OK 0
@@ -219,7 +222,7 @@ extern "C" {
   int cryptfs_verify_passwd(char *newpw);
   int cryptfs_restart(void);
   int cryptfs_enable(char *flag, int type, char *passwd, int allow_reboot);
-  int cryptfs_changepw(int type, const char *newpw);
+  int cryptfs_changepw(int type, const char *currentpw, const char *newpw);
   int cryptfs_enable_default(char *flag, int allow_reboot);
   int cryptfs_setup_ext_volume(const char* label, const char* real_blkdev,
           const unsigned char* key, int keysize, char* out_crypto_blkdev);
