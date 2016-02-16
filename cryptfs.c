@@ -3537,28 +3537,16 @@ int cryptfs_changepw(int crypt_type, const char *currentpw, const char *newpw)
         return -1;
     }
 
+    previous_type = crypt_ftr.crypt_type;
+    if (previous_type == CRYPT_TYPE_DEFAULT)
+        currentpw = DEFAULT_PASSWORD;
+
 #ifdef CONFIG_HW_DISK_ENCRYPTION
     if(is_hw_disk_encryption((char*)crypt_ftr.crypto_type_name))
         return  cryptfs_changepw_hw_fde(crypt_type, currentpw, newpw);
     else {
         crypt_ftr.crypt_type = crypt_type;
 
-        rc = encrypt_master_key(crypt_type == CRYPT_TYPE_DEFAULT ?
-                                     DEFAULT_PASSWORD : newpw,
-                                     crypt_ftr.salt,
-                                     saved_master_key,
-                                     crypt_ftr.master_key,
-                                     &crypt_ftr, false);
-        if (rc) {
-            SLOGE("Encrypt master key failed: %d", rc);
-            return -1;
-        }
-        /* save the key */
-        put_crypt_ftr_and_key(&crypt_ftr);
-
-        return 0;
-    }
-#else
     crypt_ftr.crypt_type = crypt_type;
 
     rc = encrypt_master_key(crypt_type == CRYPT_TYPE_DEFAULT ? DEFAULT_PASSWORD
